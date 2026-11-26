@@ -1,0 +1,18 @@
+services:
+  gray-release-demo:
+    build: .
+    image: gray-release-demo:latest
+    container_name: gray-release-demo
+    ports:
+      - "8000:8000"
+    environment:
+      GRAY_DB_PATH: /data/gray.db
+      GRAY_STABLE_PORT: "18081"
+      GRAY_CANDIDATE_PORT: "18082"
+      GRAY_SECRET_KEY: change-me-in-production
+    volumes:
+      - gray-data:/data
+    restart: unless-stopped
+
+volumes:
+  gray-data:

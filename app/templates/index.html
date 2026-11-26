@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>灰度升档演练（Flask + SQLite）</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header>
+  <h1>灰度升档演练</h1>
+  <p class="sub">UTC 分钟补报 / 更正 · 整段合计核算 · 更正触发回退 · 单服务 + SQLite</p>
+</header>
+
+<main>
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      <section class="flashes">
+        {% for category, message in messages %}
+          <div class="flash flash-{{ category }}">{{ message }}</div>
+        {% endfor %}
+      </section>
+    {% endif %}
+  {% endwith %}
+
+  <section class="card">
+    <h2>当前档位</h2>
+    <div class="grid">
+      <div>
+        <span class="k">状态</span>
+        {% if state['active'] %}
+          <span class="badge badge-on">已升档（候选版参与分流）</span>
+        {% else %}
+          <span class="badge badge-off">原档 / 已回退（新请求只走稳定版）</span>
+        {% endif %}
+      </div>
+      <div><span class="k">窗口（含两端，UTC）</span>
+        {% if state['window_start_minute'] %}
+          {{ state['window_start_minute'] }} ~ {{ state['window_end_minute'] }}
+        {% else %} - {% endif %}
+      </div>
+      <div><span class="k">目标分流比例</span>{{ state['target_ratio_bp'] | pct }}</div>
+      <div><span class="k">错误率上限</span>{{ state['error_limit_bp'] | pct }}</div>
+      <div><span class="k">最近更新</span>{{ state['updated_at'] or '-' }}</div>
+      <div>
+        <span class="k">试请求（网关按已提交比例转发）</span>
+        <form method="post" action="{{ url_for('trial') }}" class="inline">
+          <button type="submit">发一次试请求</button>
+        </form>
+      </div>
+    </div>
+    {% if endpoints %}
+      <p class="hint">本地应答服务：stable → {{ endpoints.stable }} ，candidate → {{ endpoints.candidate }}</p>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <h2>升档</h2>
+    <p class="hint">起止分钟必须在同一年内、含两端；按整段请求数与失败数合计核算。
+      漏报、总请求数为零或错误率超限都维持原档并提示原因。</p>
+    <form method="post" action="{{ url_for('ramp') }}" class="form">
+      <label>起始分钟（UTC）
+        <input type="datetime-local" step="60" name="window_start" required>
+      </label>
+      <label>结束分钟（UTC）
+        <input type="datetime-local" step="60" name="window_end" required>
+      </label>
+      <label>目标分流比例（%，0.01~100，两位小数）
+        <input type="number" name="target_ratio" min="0.01" max="100" step="0.01"
+               value="20.00" required>
+      </label>
+      <label>错误率上限（%，0~100，两位小数）
+        <input type="number" name="error_limit" min="0" max="100" step="0.01"
+               value="5.00" required>
+      </label>
+      <div class="actions"><button type="submit">提交升档核算</button></div>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>分钟补报 / 更正（候选版请求数与失败数）</h2>
+    <p class="hint">只填需要补报或更正的 UTC 分钟；同分钟重复提交以最后一次为准。
+      一次核对最多查 64 组日汇总（未命中也计），且不查分钟明细；
+      更正若使当前档依据时段零请求或超限，随后新请求只走稳定版，直到重新升档。</p>
+    <form method="post" action="{{ url_for('correct') }}" class="form">
+      <table id="rows">
+        <thead>
+          <tr><th>UTC 分钟</th><th>请求数</th><th>失败数</th><th></th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><input type="datetime-local" step="60" name="minute[]"></td>
+            <td><input type="number" min="0" step="1" name="requests[]"></td>
+            <td><input type="number" min="0" step="1" name="failures[]"></td>
+            <td><button type="button" class="del">删除</button></td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="actions">
+        <button type="button" id="add-row">加一行</button>
+        <button type="submit" class="primary">提交补报 / 更正</button>
+      </div>
+    </form>
+    {% if latest %}
+      <p class="hint">
+        最近一次更正：核对查过 <strong>{{ latest['checked_groups'] or 0 }}</strong> 组汇总，
+        更正改过 <strong>{{ latest['changed_groups'] or 0 }}</strong> 组汇总
+        （其中未命中 {{ latest['missed_groups'] or 0 }} 组）— {{ latest['message'] }}
+      </p>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <h2>数据与核对</h2>
+    <div class="grid">
+      <div><span class="k">分钟记录数</span>{{ overview['minute_rows'] }}</div>
+      <div><span class="k">日汇总组数</span>{{ overview['summary_groups'] }}</div>
+      <div><span class="k">汇总请求合计</span>{{ overview['total_requests'] }}</div>
+      <div><span class="k">汇总失败合计</span>{{ overview['total_failures'] }}</div>
+    </div>
+    <h3>最近动作</h3>
+    <table class="logs">
+      <thead><tr><th>时间（UTC）</th><th>类型</th><th>结果</th><th>核对/改动/未命中</th><th>说明</th></tr></thead>
+      <tbody>
+      {% for log in logs %}
+        <tr>
+          <td>{{ log['ts'] }}</td>
+          <td>{{ '升档' if log['kind'] == 'ramp' else '更正' }}</td>
+          <td>{% if log['accepted'] %}<span class="ok">接受</span>
+              {% else %}<span class="no">拒绝/维持原档</span>{% endif %}</td>
+          <td>
+            {% if log['checked_groups'] is not none %}
+              {{ log['checked_groups'] }} / {{ log['changed_groups'] }} / {{ log['missed_groups'] }}
+            {% else %}-{% endif %}
+          </td>
+          <td>{{ log['message'] }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="5" class="hint">暂无动作</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </section>
+</main>
+
+<script>
+const tbody = document.querySelector('#rows tbody');
+document.getElementById('add-row').addEventListener('click', () => {
+  const tr = tbody.querySelector('tr').cloneNode(true);
+  tr.querySelectorAll('input').forEach(i => { i.value = ''; });
+  tbody.appendChild(tr);
+});
+tbody.addEventListener('click', (e) => {
+  if (e.target.classList.contains('del') && tbody.querySelectorAll('tr').length > 1) {
+    e.target.closest('tr').remove();
+  }
+});
+</script>
+</body>
+</html>
